@@ -56,6 +56,19 @@ def _connect(dsn=None, connect_timeout=None, autocommit=False, **kwargs):
 psycopg.connect = _connect
 
 
+# lockdiag.py does `from psycopg.rows import dict_row`; provide the submodule.
+rows_mod = types.ModuleType("psycopg.rows")
+
+
+def _dict_row(*args, **kwargs):
+    return None
+
+
+rows_mod.dict_row = _dict_row
+psycopg.rows = rows_mod
+sys.modules["psycopg.rows"] = rows_mod
+
+
 class PoolTimeout(Exception):
     pass
 
@@ -222,6 +235,68 @@ def wait_terminal(mgr, timeout=15.0):
             return snap
         time.sleep(0.02)
     raise AssertionError("run did not finish in time")
+
+
+# ---- fake diagnostic connection (lockdiag.LockDiagnoser) -----------------
+
+
+class FakeDiagCursor:
+    def __init__(self, rows_supplier):
+        self._rows_supplier = rows_supplier
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def execute(self, sql, params=None):
+        pass
+
+    def fetchall(self):
+        return self._rows_supplier()
+
+
+class FakeDiagConn:
+    """Stand-in for the single dedicated diagnostic connection."""
+
+    def __init__(self, rows_supplier):
+        self._rows_supplier = rows_supplier
+        self.closed = False
+        self.executed = []
+
+    def execute(self, sql, params=None):
+        self.executed.append(sql)
+
+    def cursor(self):
+        return FakeDiagCursor(self._rows_supplier)
+
+    def close(self):
+        self.closed = True
+
+
+def make_diag_factory(rows_supplier, calls=None):
+    def _factory(dsn, **kwargs):
+        if calls is not None:
+            calls.append(dsn)
+        return FakeDiagConn(rows_supplier)
+    return _factory
+
+
+def blocked_row(pid, blocker_pid=4242):
+    return {
+        "pid": pid,
+        "sampled_at": "2026-11-15T01:00:00.123456+00:00",
+        "wait_event_type": "Lock",
+        "wait_event": "relation",
+        "state": "active",
+        "blocker_pid": blocker_pid,
+        "blocker_xact_start": "2026-11-15T00:59:00+00:00",
+        "blocker_query": "LOCK TABLE sales IN ACCESS EXCLUSIVE MODE",
+        "blocker_user": "replay",
+        "blocker_app": "psql",
+        "blocker_state": "idle in transaction",
+    }
 
 
 class TestRunManager(engine.RunManager):
@@ -393,6 +468,160 @@ def test_one_round_at_a_time():
     print("OK test_one_round_at_a_time")
 
 
+def test_diag_samples_attributed_and_kept_after_finish():
+    """Blocked samples land on the right request and survive its finish."""
+    pool = FakePool(2)
+
+    def rows_supplier():
+        # Report a Lock/relation wait for every connection currently busy.
+        return [blocked_row(c.info.backend_pid)
+                for c in pool._conns if c.running.is_set()]
+
+    mgr = engine.RunManager(pool, TEMPLATES, diag_dsn=FAKE_DSN,
+                            diag_connect_factory=make_diag_factory(rows_supplier))
+    # slow_cancelable runs until the 3s watchdog cancel -> ~3s of sampling.
+    mgr.start([{"arrival_ms": 0, "template": "slow_cancelable", "store": "9"}])
+    snap = wait_terminal(mgr, timeout=12)
+    r1 = by_id(snap)[1]
+    assert r1["status"] == "timeout", r1
+    lw = r1["lock_wait"]
+    assert lw["state"] == "sampled", lw
+    assert lw["sample_count"] >= 3, lw  # ~3s at 0.2s interval
+    b = lw["last_blocked"]
+    assert b["blocker_pid"] == 4242, b
+    assert b["wait_event_type"] == "Lock" and b["wait_event"] == "relation", b
+    assert b["blocker_query"] == "LOCK TABLE sales IN ACCESS EXCLUSIVE MODE", b
+    assert b["blocker_xact_start"].startswith("2026-11-15T00:59"), b
+    assert b["sampled_at"], b
+    assert snap["diag"]["available"] is True, snap["diag"]
+    assert snap["diag"]["samples_taken"] >= 3, snap["diag"]
+    assert pool.in_use == 0, "worker connections returned"
+    print("OK test_diag_samples_attributed_and_kept_after_finish")
+
+
+def test_late_diag_sample_never_attributed_after_reuse():
+    """A sample captured for one owner must not leak into the next request
+    re-using the same connection, nor into a finished request."""
+    pool = FakePool(1)  # single connection: forces reuse
+    mgr = engine.RunManager(pool, TEMPLATES)  # no diagnoser: drive manually
+    rows = [
+        {"arrival_ms": 0, "template": "slow_cancelable", "store": "1"},
+        {"arrival_ms": 3300, "template": "slow_cancelable", "store": "2"},
+    ]
+    mgr.start(rows)
+    run = mgr._run
+
+    # Wait until request 1 is executing, then capture the ownership token.
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        targets = run.diag_targets()
+        if targets:
+            break
+        time.sleep(0.02)
+    assert targets, "request 1 never went in-flight"
+    req1_id, (seq1, pid1) = next(iter(targets.items()))
+    assert req1_id == 1
+
+    # Wait until request 2 is executing on the SAME connection (reuse).
+    deadline = time.time() + 12
+    while time.time() < deadline:
+        targets2 = run.diag_targets()
+        if 2 in targets2:
+            break
+        time.sleep(0.02)
+    assert 2 in targets2, "request 2 never went in-flight"
+    seq2, pid2 = targets2[2]
+    assert pid2 == pid1, "expected the same physical connection to be reused"
+    assert seq2 != seq1
+
+    # The stale sample (captured for request 1's ownership) arrives late,
+    # while request 2 owns the connection: it must be dropped entirely.
+    run.record_diag_samples(targets, [blocked_row(pid1)])
+    reqs = by_id(mgr.snapshot())
+    assert reqs[1]["lock_wait"]["sample_count"] == 0, reqs[1]["lock_wait"]
+    assert reqs[2]["lock_wait"]["sample_count"] == 0, reqs[2]["lock_wait"]
+
+    # A fresh sample taken for request 2's ownership DOES land on request 2.
+    run.record_diag_samples(targets2, [blocked_row(pid2)])
+    reqs = by_id(mgr.snapshot())
+    assert reqs[2]["lock_wait"]["sample_count"] == 1, reqs[2]["lock_wait"]
+    assert reqs[1]["lock_wait"]["sample_count"] == 0, reqs[1]["lock_wait"]
+
+    snap = wait_terminal(mgr, timeout=15)
+    reqs = by_id(snap)
+    # Evidence collected for request 2 is kept after it finished.
+    assert reqs[2]["lock_wait"]["state"] == "sampled", reqs[2]["lock_wait"]
+    assert reqs[2]["lock_wait"]["sample_count"] == 1
+    print("OK test_late_diag_sample_never_attributed_after_reuse")
+
+
+def test_unknown_when_sampler_ran_but_collected_nothing():
+    """Diagnostics healthy but no sample for the request -> 'unknown',
+    never 'no blocking'."""
+    pool = FakePool(2)
+    mgr = engine.RunManager(
+        pool, TEMPLATES, diag_dsn=FAKE_DSN,
+        diag_connect_factory=make_diag_factory(lambda: []))  # empty samples
+    mgr.start([{"arrival_ms": 0, "template": "slow_cancelable", "store": "9"}])
+    snap = wait_terminal(mgr, timeout=12)
+    r1 = by_id(snap)[1]
+    assert r1["status"] == "timeout", r1
+    lw = r1["lock_wait"]
+    assert lw["state"] == "unknown", lw
+    assert lw["sample_count"] == 0
+    assert snap["diag"]["available"] is True, snap["diag"]
+    print("OK test_unknown_when_sampler_ran_but_collected_nothing")
+
+
+def test_diag_failure_marks_unavailable_without_blocking_engine():
+    """A broken diagnostic connection shows 'unavailable' and must not
+    delay deadlines, cancels, state reads, or connection returns."""
+    pool = FakePool(2)
+
+    def boom_factory(dsn, **kwargs):
+        raise RuntimeError("diag connection refused")
+
+    mgr = engine.RunManager(pool, TEMPLATES, diag_dsn=FAKE_DSN,
+                            diag_connect_factory=boom_factory)
+    rows = [
+        {"arrival_ms": 0, "template": "fast", "store": "1"},
+        {"arrival_ms": 0, "template": "slow_cancelable", "store": "2"},
+    ]
+    mgr.start(rows)
+    snap = wait_terminal(mgr, timeout=12)
+    reqs = by_id(snap)
+    # Engine semantics fully intact despite the broken diagnoser.
+    assert reqs[1]["status"] == "success", reqs[1]
+    assert reqs[2]["status"] == "timeout", reqs[2]  # 3s deadline enforced
+    assert reqs[2]["exec_ms"] < 4000, reqs[2]       # not delayed by diag
+    assert pool.in_use == 0, "worker connections returned"
+    assert snap["diag"]["available"] is False, snap["diag"]
+    assert snap["diag"]["note"], snap["diag"]
+    # Executed requests with no evidence are 'unavailable', not 'no blocking'.
+    assert reqs[1]["lock_wait"]["state"] == "unavailable", reqs[1]["lock_wait"]
+    assert reqs[2]["lock_wait"]["state"] == "unavailable", reqs[2]["lock_wait"]
+    print("OK test_diag_failure_marks_unavailable_without_blocking_engine")
+
+
+def test_not_run_and_queued_states_have_no_diag_claim():
+    """Requests that never executed must not claim any lock diagnosis."""
+    pool = FakePool(2)
+    mgr = TestRunManager(pool, TEMPLATES)
+    rows = [
+        {"arrival_ms": 0, "template": "slow", "store": "1"},
+        {"arrival_ms": 0, "template": "slow", "store": "2"},
+        {"arrival_ms": 100, "template": "fast", "store": "3"},
+    ]
+    mgr.start(rows)
+    time.sleep(3.5)  # request 3 expires in the queue without executing
+    r3 = by_id(mgr.snapshot())[3]
+    assert r3["status"] == "timeout", r3
+    assert r3["lock_wait"]["state"] == "not_run", r3["lock_wait"]
+    mgr.cancel()
+    wait_terminal(mgr)
+    print("OK test_not_run_and_queued_states_have_no_diag_claim")
+
+
 if __name__ == "__main__":
     test_fast_requests_succeed_and_pool_caps_at_two()
     test_queue_timeout_never_executes()
@@ -402,4 +631,9 @@ if __name__ == "__main__":
     test_sql_error_reported_and_connection_recovered()
     test_burst_of_30_caps_at_two_connections_and_terminates_all()
     test_one_round_at_a_time()
+    test_diag_samples_attributed_and_kept_after_finish()
+    test_late_diag_sample_never_attributed_after_reuse()
+    test_unknown_when_sampler_ran_but_collected_nothing()
+    test_diag_failure_marks_unavailable_without_blocking_engine()
+    test_not_run_and_queued_states_have_no_diag_claim()
     print("\nALL ENGINE TESTS PASSED")

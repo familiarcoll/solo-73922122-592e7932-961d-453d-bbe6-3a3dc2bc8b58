@@ -30,11 +30,15 @@ def _make_configure(dsn: str):
     return _configure
 
 
-def create_pool() -> ConnectionPool:
-    dsn = os.environ.get(
+def get_dsn() -> str:
+    return os.environ.get(
         "DATABASE_URL",
         "postgresql://replay:replay@db:5432/replay",
     )
+
+
+def create_pool() -> ConnectionPool:
+    dsn = get_dsn()
     pool = ConnectionPool(
         conninfo=dsn,
         min_size=MAX_CONNS,

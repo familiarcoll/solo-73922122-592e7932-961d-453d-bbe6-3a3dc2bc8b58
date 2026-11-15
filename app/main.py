@@ -21,7 +21,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from csvutil import MAX_ROWS, CSVValidationError, parse_replay_csv
-from db import create_pool, load_templates
+from db import create_pool, get_dsn, load_templates
 from engine import RunConflict, RunManager
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -35,7 +35,9 @@ async def lifespan(app: FastAPI):
     pool = create_pool()
     templates = load_templates(pool)
     app.state.pool = pool
-    app.state.manager = RunManager(pool, templates)
+    # Lock-wait diagnostics use ONE dedicated connection per round (opened
+    # lazily by the sampler), never one of the two pooled worker conns.
+    app.state.manager = RunManager(pool, templates, diag_dsn=get_dsn())
     app.state.templates = templates
     try:
         yield

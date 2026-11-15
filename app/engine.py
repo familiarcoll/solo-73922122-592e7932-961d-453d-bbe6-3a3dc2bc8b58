@@ -24,14 +24,18 @@ Guarantees implemented here:
 
 from __future__ import annotations
 
+import itertools
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import ClassVar, Optional
 
 import psycopg
 import psycopg_pool
+
+from lockdiag import LockDiagnoser
+from lockdiag import STALE_SECONDS as DIAG_STALE_SECONDS
 
 # --- Tunable policy constants ---------------------------------------------
 
@@ -45,6 +49,8 @@ ACQUIRE_CHUNK_SECONDS = 0.05
 # Hard server-side backstop.  The 3s budget is enforced in application code;
 # this only protects against a query whose cancellation somehow failed.
 STATEMENT_TIMEOUT_MS = 15_000
+# Lock-wait samples kept per request (oldest dropped beyond this).
+MAX_LOCK_SAMPLES = 20
 
 
 # --- Per-request state -----------------------------------------------------
@@ -66,6 +72,11 @@ class RequestState:
     started_at: Optional[float] = None
     finished_at: Optional[float] = None
     sqlstate: Optional[str] = None
+    # Lock-wait evidence sampled while THIS request was executing.  Kept
+    # after the request finishes; an empty list after execution means
+    # "unknown" (or diagnostics unavailable), never "no blocking".
+    lock_samples: list[dict] = field(default_factory=list)
+    diag_unavailable: bool = False
 
     def as_dict(self) -> dict:
         def rnd(v):
@@ -83,6 +94,34 @@ class RequestState:
             "rows": self.rows,
             "error": self.error,
             "sqlstate": self.sqlstate,
+            "lock_wait": self._lock_wait_dict(),
+        }
+
+    def _lock_wait_dict(self) -> dict:
+        samples = list(self.lock_samples)
+        blocked = [s for s in samples if s.get("blocked")]
+        if self.status == "queued":
+            state = "pending"
+        elif self.started_at is None and self.status != "running":
+            # Expired/canceled while queued: never executed, nothing to
+            # diagnose (this is NOT "unknown" - no SQL ever ran).
+            state = "not_run"
+        elif self.status == "running":
+            state = "sampling"
+        elif samples:
+            state = "sampled"
+        elif self.diag_unavailable:
+            state = "unavailable"
+        else:
+            # Executed but no sample was collected: unknown, must not be
+            # reported as "no blocking".
+            state = "unknown"
+        return {
+            "state": state,
+            "sample_count": len(samples),
+            "last": samples[-1] if samples else None,
+            "last_blocked": blocked[-1] if blocked else None,
+            "samples": samples,
         }
 
 
@@ -94,8 +133,14 @@ class RunConflict(RuntimeError):
 class InFlight:
     """Ownership record for a request currently holding a connection."""
 
+    _seq_counter: ClassVar = itertools.count(1)
+
     req: RequestState
     conn: object
+    # Monotonic ownership tag: diagnostics sampled for one (request, seq,
+    # pid) triple can never be attributed to a later owner of the same
+    # connection.
+    seq: int = field(default_factory=lambda: next(InFlight._seq_counter))
     timeout_token: threading.Event = field(default_factory=threading.Event)
     cancel_token: threading.Event = field(default_factory=threading.Event)
     done_event: threading.Event = field(default_factory=threading.Event)
@@ -107,9 +152,13 @@ class InFlight:
 
 
 class RunManager:
-    def __init__(self, pool, templates: dict[str, str]):
+    def __init__(self, pool, templates: dict[str, str],
+                 diag_dsn: Optional[str] = None,
+                 diag_connect_factory=None):
         self._pool = pool
         self._templates = templates  # name -> SQL text
+        self._diag_dsn = diag_dsn
+        self._diag_connect_factory = diag_connect_factory
         self._lock = threading.RLock()
         self._run: Optional[Run] = None
 
@@ -119,7 +168,9 @@ class RunManager:
         with self._lock:
             if self._run is not None and self._run.status == "running":
                 raise RunConflict("A replay round is already running.")
-            run = Run(self._pool, self._templates, rows)
+            run = Run(self._pool, self._templates, rows,
+                      diag_dsn=self._diag_dsn,
+                      diag_connect_factory=self._diag_connect_factory)
             self._run = run
         run.launch()
         return run.snapshot()
@@ -148,7 +199,9 @@ class RunManager:
 class Run:
     """One replay round.  All mutable state is guarded by ``self._lock``."""
 
-    def __init__(self, pool, templates: dict[str, str], rows: list[dict]):
+    def __init__(self, pool, templates: dict[str, str], rows: list[dict],
+                 diag_dsn: Optional[str] = None,
+                 diag_connect_factory=None):
         self._pool = pool
         self._templates = templates
         self._lock = threading.RLock()
@@ -156,6 +209,23 @@ class Run:
         self.status = "running"  # running | completed | canceled
         self.started_wall = time.time()
         self.finished_wall: Optional[float] = None
+
+        # Lock-wait diagnostics: one background sampler on ONE dedicated
+        # connection (never one of the two pooled worker connections).
+        self._diagnoser: Optional[LockDiagnoser] = (
+            LockDiagnoser(self, diag_dsn,
+                          connect_factory=diag_connect_factory)
+            if diag_dsn else None
+        )
+        self._diag = {
+            "enabled": self._diagnoser is not None,
+            "available": False,
+            "note": None if self._diagnoser else "diagnostics not configured",
+            "started_mono": time.monotonic(),
+            "last_ok_mono": 0.0,
+            "samples_taken": 0,
+            "reconnects": 0,
+        }
 
         # Requests ordered by planned arrival.
         self._requests: list[RequestState] = [
@@ -188,6 +258,8 @@ class Run:
     # ------------------------------------------------------------------ launch
 
     def launch(self) -> None:
+        if self._diagnoser is not None:
+            self._diagnoser.start()
         self._scheduler = threading.Thread(
             target=self._schedule, name="scheduler", daemon=True)
         self._scheduler.start()
@@ -360,6 +432,11 @@ class Run:
                 req.status = "error"
             else:
                 req.status = "success"
+            # Executed but no evidence collected: record WHY (diagnostics
+            # unavailable vs. simply not sampled) so the snapshot can say
+            # "unknown"/"unavailable" instead of implying "no blocking".
+            if not req.lock_samples:
+                req.diag_unavailable = self._diag_failed()
 
     def _watchdog(self, inflight: InFlight, deadline: float) -> None:
         """Stop the SQL exactly once, only for its owning request."""
@@ -425,6 +502,104 @@ class Run:
                 self._cancel_conn(inflight)
         return self.snapshot()
 
+    # ---------------------------------------------------- lock diagnostics
+    # These methods are called by the LockDiagnoser thread only.  They never
+    # touch a worker connection and never block the engine paths above.
+
+    def diag_targets(self) -> dict[int, tuple[int, int]]:
+        """Ownership snapshot for one sampling pass.
+
+        Returns ``{request_id: (inflight_seq, backend_pid)}`` for requests
+        executing right now.  The triple is re-validated when the sample
+        rows come back, so a late result can never be attributed to a
+        request that later re-uses the same connection.
+        """
+        with self._lock:
+            targets: dict[int, tuple[int, int]] = {}
+            for inflight in self._inflight.values():
+                try:
+                    pid = inflight.conn.info.backend_pid
+                except Exception:
+                    continue
+                targets[inflight.req.id] = (inflight.seq, pid)
+            return targets
+
+    def record_diag_samples(self, targets: dict[int, tuple[int, int]],
+                            rows: list[dict]) -> None:
+        """Attribute returned sample rows to their owning requests.
+
+        A row is only recorded if the (request, seq, pid) triple captured
+        before the diagnostic query still matches the current in-flight
+        owner; otherwise the row is stale (request finished, connection
+        re-used, or a new round started) and is dropped.
+        """
+        if not rows:
+            return
+        by_pid: dict[int, list[tuple[int, int]]] = {}
+        for req_id, (seq, pid) in targets.items():
+            by_pid.setdefault(pid, []).append((req_id, seq))
+        with self._lock:
+            inflight_by_req = {inf.req.id: inf
+                               for inf in self._inflight.values()}
+            for row in rows:
+                try:
+                    pid = row.get("pid")
+                except AttributeError:
+                    continue
+                for req_id, seq in by_pid.get(pid, ()):
+                    inflight = inflight_by_req.get(req_id)
+                    if inflight is None or inflight.seq != seq:
+                        continue  # stale: owner changed since sampling
+                    try:
+                        if inflight.conn.info.backend_pid != pid:
+                            continue
+                    except Exception:
+                        continue
+                    sample = _sample_row_to_dict(row)
+                    samples = inflight.req.lock_samples
+                    samples.append(sample)
+                    del samples[:-MAX_LOCK_SAMPLES]
+                    self._diag["samples_taken"] += 1
+
+    def diag_mark_ok(self) -> None:
+        with self._lock:
+            self._diag["available"] = True
+            self._diag["note"] = None
+            self._diag["last_ok_mono"] = time.monotonic()
+
+    def diag_mark_unavailable(self, note: str) -> None:
+        with self._lock:
+            self._diag["available"] = False
+            self._diag["note"] = note
+
+    def diag_note_reconnect(self) -> None:
+        with self._lock:
+            self._diag["reconnects"] += 1
+
+    def _diag_failed(self) -> bool:
+        """Whether the diagnostic pipeline is known-broken right now.
+
+        Caller holds the lock.  Three ways to be "failed": not configured,
+        an explicit failure note from the sampler, or silence — a sampler
+        that once succeeded (or that had its whole startup grace window)
+        but produced no success within DIAG_STALE_SECONDS is stuck.
+        """
+        d = self._diag
+        if not d["enabled"]:
+            return True
+        if d["note"]:
+            return True
+        now = time.monotonic()
+        if d["last_ok_mono"] > 0:
+            return now - d["last_ok_mono"] > DIAG_STALE_SECONDS
+        # Never succeeded: allow a startup grace window (connect timeout +
+        # first probe) before declaring the diagnostics unavailable.
+        return now - d["started_mono"] > DIAG_STALE_SECONDS
+
+    def _diag_healthy(self) -> bool:
+        # Caller holds the lock.
+        return self._diag["enabled"] and not self._diag_failed()
+
     # ------------------------------------------------------------- bookkeeping
 
     def _finish_without_conn(self, req: RequestState, status: str,
@@ -476,6 +651,10 @@ class Run:
         # ...then every submitted request has fully finished (SQL stopped,
         # transaction cleaned, connection returned).
         self._executor.shutdown(wait=True)
+        # Stop the diagnostic sampler last; its stop() is time-bounded and
+        # never delays worker-connection cleanup above.
+        if self._diagnoser is not None:
+            self._diagnoser.stop()
         with self._lock:
             self.finished_wall = time.time()
             self.status = "canceled" if self._cancel_event.is_set() else "completed"
@@ -492,6 +671,7 @@ class Run:
                 "canceled": sum(r.status == "canceled" for r in self._requests),
                 "in_flight": len(self._inflight),
             }
+            d = self._diag
             return {
                 "status": self.status,
                 "cancel_requested": self._cancel_event.is_set(),
@@ -503,5 +683,38 @@ class Run:
                     "deadline_seconds": REQUEST_DEADLINE_SECONDS,
                     "statement_timeout_ms": STATEMENT_TIMEOUT_MS,
                 },
+                "diag": {
+                    "enabled": d["enabled"],
+                    "available": self._diag_healthy(),
+                    "note": d["note"],
+                    "samples_taken": d["samples_taken"],
+                    "reconnects": d["reconnects"],
+                },
                 "requests": [r.as_dict() for r in self._requests],
             }
+
+
+def _iso(value) -> Optional[str]:
+    """datetime -> ISO string; pass through strings; None stays None."""
+    if value is None:
+        return None
+    isoformat = getattr(value, "isoformat", None)
+    return isoformat() if callable(isoformat) else str(value)
+
+
+def _sample_row_to_dict(row: dict) -> dict:
+    """One lock-wait sample as reported to the UI (JSON-safe)."""
+    blocker_pid = row.get("blocker_pid")
+    return {
+        "sampled_at": _iso(row.get("sampled_at")),
+        "wait_event_type": row.get("wait_event_type"),
+        "wait_event": row.get("wait_event"),
+        "state": row.get("state"),
+        "blocked": blocker_pid is not None,
+        "blocker_pid": blocker_pid,
+        "blocker_xact_start": _iso(row.get("blocker_xact_start")),
+        "blocker_query": row.get("blocker_query"),
+        "blocker_user": row.get("blocker_user"),
+        "blocker_app": row.get("blocker_app"),
+        "blocker_state": row.get("blocker_state"),
+    }

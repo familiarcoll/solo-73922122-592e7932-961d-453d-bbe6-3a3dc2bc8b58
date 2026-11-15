@@ -50,6 +50,22 @@
   .muted { color:var(--muted); }
   #msg { margin-top:10px; font-size:13px; min-height:20px; }
   #msg.err { color:var(--err); } #msg.ok { color:var(--ok); }
+  /* --- lock-wait diagnostics --- */
+  .diagcell { cursor:pointer; white-space:normal; min-width:170px; max-width:260px; }
+  .diagcell .more { color:var(--muted); font-size:11px; margin-left:6px; }
+  .blocked-text { color:var(--warn); font-weight:700; }
+  .unknown-text { color:var(--muted); }
+  .unavail-text { color:var(--err); }
+  tr.diag-detail td { background:#16213a; white-space:normal; padding:12px 14px; }
+  .diagpanel h4 { margin:2px 0 8px; font-size:13px; color:var(--accent); }
+  .diagpanel .note { color:var(--muted); font-size:12px; margin-bottom:8px; }
+  table.diag { font-size:12px; margin-top:4px; }
+  table.diag th, table.diag td { padding:5px 8px; white-space:nowrap; }
+  table.diag td.sql { max-width:300px; overflow:hidden; text-overflow:ellipsis;
+                      white-space:nowrap; color:var(--muted); }
+  table.diag tr.isblocked td { color:var(--warn); }
+  .badge.diag-ok b { color:var(--ok); }
+  .badge.diag-bad b { color:var(--err); }
 </style>
 </head>
 <body>
@@ -73,16 +89,19 @@
     <div class="status-line">轮次状态：<span id="runStatus" class="pill queued">空闲</span>
       <span class="muted" id="timing"></span></div>
     <div class="badges" id="badges"></div>
+    <div class="badges"><span class="badge" id="diagStatus">诊断采样：—</span></div>
   </div>
 
   <div class="card">
     <table>
       <thead><tr>
         <th>#</th><th>到达(ms)</th><th>模板</th><th>门店</th><th>状态</th>
-        <th>排队(ms)</th><th>执行(ms)</th><th>总耗时(ms)</th><th>行数</th><th>说明</th>
+        <th>排队(ms)</th><th>执行(ms)</th><th>总耗时(ms)</th><th>行数</th>
+        <th>锁等待诊断</th><th>说明</th>
       </tr></thead>
-      <tbody id="tbody"><tr><td colspan="10" class="muted">尚未开始。</td></tr></tbody>
+      <tbody id="tbody"><tr><td colspan="11" class="muted">尚未开始。</td></tr></tbody>
     </table>
+    <div class="hint">点击“锁等待诊断”单元格可展开/收起该请求的采样证据（采样时间、等待类型/事件、直接阻塞者 PID、事务开始时间与 SQL）。</div>
   </div>
 </main>
 
@@ -94,6 +113,7 @@ const STATUS_TEXT = {
 };
 let pollTimer = null;
 let lastSignature = {};
+const expanded = {};  // request id -> show lock-wait sample panel
 
 const $ = (id) => document.getElementById(id);
 
@@ -101,6 +121,79 @@ function setMsg(text, kind) {
   const el = $("msg");
   el.textContent = text || "";
   el.className = kind || "";
+}
+
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"']/g,
+    (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+function fmtClock(iso) {
+  // "2026-11-15T01:23:45.678901+00:00" -> "01:23:45.678"
+  if (!iso) return "—";
+  const t = iso.includes("T") ? iso.split("T")[1] : iso;
+  return t.slice(0, 12);
+}
+
+function fmtTs(iso) {
+  if (!iso) return "—";
+  return iso.replace("T", " ").slice(0, 19);
+}
+
+function diagSummary(r) {
+  const lw = r.lock_wait || {};
+  switch (lw.state) {
+    case "pending":   return `<span class="unknown-text">—</span>`;
+    case "not_run":   return `<span class="unknown-text">未执行</span>`;
+    case "sampling": {
+      const b = lw.last_blocked;
+      if (b) return `<span class="blocked-text">🔒 ${esc(b.wait_event_type)}/${esc(b.wait_event)} ← PID ${b.blocker_pid}</span>`;
+      return `<span class="unknown-text">采样中…</span>`;
+    }
+    case "sampled": {
+      const b = lw.last_blocked;
+      if (b) return `<span class="blocked-text">🔒 ${esc(b.wait_event_type)}/${esc(b.wait_event)} ← PID ${b.blocker_pid}</span>`;
+      return `<span class="unknown-text">已采样 ${lw.sample_count} 次 · 未见锁等待</span>`;
+    }
+    case "unavailable": return `<span class="unavail-text">诊断不可用</span>`;
+    default:          return `<span class="unknown-text">未知（未采到样本）</span>`;
+  }
+}
+
+function diagPanel(r) {
+  const lw = r.lock_wait || {};
+  const samples = lw.samples || [];
+  let note;
+  if (lw.state === "sampled" || lw.state === "sampling") {
+    note = `执行期间共采到 ${lw.sample_count} 个样本（请求结束后保留）。`;
+  } else if (lw.state === "unknown") {
+    note = "未采到样本：锁等待情况未知（不等于无阻塞）。";
+  } else if (lw.state === "unavailable") {
+    note = "诊断采样不可用（连接失败或卡住），锁等待情况未知。";
+  } else if (lw.state === "not_run") {
+    note = "请求未执行（排队阶段已结束），无诊断样本。";
+  } else {
+    note = "等待执行。";
+  }
+  let rows = "";
+  if (samples.length) {
+    rows = `<table class="diag"><thead><tr>
+      <th>采样时间</th><th>等待类型</th><th>等待事件</th><th>会话状态</th>
+      <th>阻塞者PID</th><th>阻塞者事务开始</th><th>阻塞者SQL</th><th>阻塞者用户/应用</th>
+      </tr></thead><tbody>` +
+      samples.map((s) => `<tr class="${s.blocked ? "isblocked" : ""}">
+        <td>${fmtClock(s.sampled_at)}</td>
+        <td>${esc(s.wait_event_type) || "—"}</td>
+        <td>${esc(s.wait_event) || "—"}</td>
+        <td>${esc(s.state) || "—"}</td>
+        <td>${s.blocked ? s.blocker_pid : "—"}</td>
+        <td>${s.blocked ? fmtTs(s.blocker_xact_start) : "—"}</td>
+        <td class="sql" title="${esc(s.blocker_query || "")}">${s.blocked ? esc(s.blocker_query || "") : "—"}</td>
+        <td>${s.blocked ? esc([s.blocker_user, s.blocker_app].filter(Boolean).join(" / ")) : "—"}</td>
+      </tr>`).join("") + `</tbody></table>`;
+  }
+  return `<div class="diagpanel"><h4>请求 #${r.id} · 锁等待诊断</h4>
+    <div class="note">${note}</div>${rows}</div>`;
 }
 
 function render(state) {
@@ -121,6 +214,19 @@ function render(state) {
     ["错误", s.error], ["取消", s.canceled], ["执行中", s.in_flight],
   ].map(([k,v]) => `<span class="badge">${k} <b>${v ?? 0}</b></span>`).join("");
 
+  const d = state.diag || {};
+  const diagEl = $("diagStatus");
+  if (!d.enabled) {
+    diagEl.innerHTML = "诊断采样：<b>未启用</b>";
+    diagEl.className = "badge diag-bad";
+  } else if (d.available) {
+    diagEl.innerHTML = `诊断采样：<b>正常</b> · 已采 ${d.samples_taken ?? 0} 个样本`;
+    diagEl.className = "badge diag-ok";
+  } else {
+    diagEl.innerHTML = `诊断采样：<b>不可用</b>${d.note ? " · " + esc(d.note) : ""}`;
+    diagEl.className = "badge diag-bad";
+  }
+
   const cfg = state.config || {};
   $("timing").textContent = cfg.max_connections
     ? ` · 连接上限 ${cfg.max_connections} · 单请求截止 ${cfg.deadline_seconds}s · 服务端 statement_timeout ${cfg.statement_timeout_ms}ms`
@@ -129,15 +235,18 @@ function render(state) {
   const tbody = $("tbody");
   const reqs = state.requests || [];
   if (!reqs.length) {
-    tbody.innerHTML = `<tr><td colspan="10" class="muted">尚未开始。</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="11" class="muted">尚未开始。</td></tr>`;
     return;
   }
+  const dash = (v) => v === null || v === undefined ? "—" : v;
   tbody.innerHTML = reqs.map((r) => {
-    const sig = r.status + "|" + (r.queue_ms ?? "") + "|" + (r.exec_ms ?? "") + "|" + (r.total_ms ?? "");
+    const lw = r.lock_wait || {};
+    const sig = r.status + "|" + (r.queue_ms ?? "") + "|" + (r.exec_ms ?? "")
+      + "|" + (r.total_ms ?? "") + "|" + (lw.sample_count ?? 0)
+      + "|" + ((lw.last_blocked || {}).blocker_pid ?? "");
     const changed = lastSignature[r.id] !== sig;
     lastSignature[r.id] = sig;
-    const dash = (v) => v === null || v === undefined ? "—" : v;
-    return `<tr class="${changed ? "flash" : ""}">
+    let html = `<tr class="${changed ? "flash" : ""}">
       <td>${r.id}</td>
       <td>${r.arrival_ms}</td>
       <td>${r.template}</td>
@@ -147,8 +256,13 @@ function render(state) {
       <td>${dash(r.exec_ms)}</td>
       <td>${dash(r.total_ms)}</td>
       <td>${dash(r.rows)}</td>
+      <td class="diagcell" data-reqid="${r.id}">${diagSummary(r)}<span class="more">${expanded[r.id] ? "▾ 收起" : "▸ 详情"}</span></td>
       <td class="err">${r.error ?? ""}</td>
     </tr>`;
+    if (expanded[r.id]) {
+      html += `<tr class="diag-detail"><td colspan="11">${diagPanel(r)}</td></tr>`;
+    }
+    return html;
   }).join("");
 
   if (!running) {
@@ -159,6 +273,14 @@ function render(state) {
       state.status === "completed" ? "ok" : "");
   }
 }
+
+$("tbody").addEventListener("click", (ev) => {
+  const cell = ev.target.closest("td.diagcell");
+  if (!cell) return;
+  const id = cell.dataset.reqid;
+  expanded[id] = !expanded[id];
+  refresh();
+});
 
 async function refresh() {
   try {
@@ -180,6 +302,7 @@ $("startBtn").addEventListener("click", async () => {
     const data = await res.json();
     if (!res.ok) { setMsg("启动失败：" + (data.detail || res.status), "err"); return; }
     lastSignature = {};
+    Object.keys(expanded).forEach((k) => delete expanded[k]);
     setMsg("回放进行中…");
     render(data);
     if (pollTimer) clearInterval(pollTimer);
